@@ -39,7 +39,9 @@ The per-peer state machine wrapping one connection; each peer has at most one cu
 Both peers dial each other at the same time, producing two connections. Resolution is deterministic: the connection on which the lower-pubkey side is the client wins on both ends.
 
 ### Deferred Candidate
-When an existing session is kept over an incoming replacement connection, the replacement parks as a candidate until the predecessor session finishes, then promotes. While parked, the candidate's connection has no reader: call messages sent to it are dropped (issue #81).
+When an existing session is kept over an incoming replacement connection, the replacement parks as a candidate until the predecessor session finishes, then promotes. While parked, it may establish transport and retain one received protocol message, but it must not negotiate that message until promotion.
+
+Candidate cancellation must interrupt every parked network wait so manager reset and shutdown can complete even if the replacement peer never finishes stream bootstrap.
 
 ## Call Lifecycle
 
