@@ -812,6 +812,7 @@ where
             should_keep_new_session(&local_peer, &peer, connection.side().is_client());
         let mut states = self.session_states.write().await;
         let mut deferred_candidate = None;
+        let mut retained_transport = None;
         let old_state_option = if let Some(old_state) = states.get(&peer).cloned() {
             if keep_new_session {
                 states.insert(peer, state.clone());
@@ -862,8 +863,120 @@ where
                     connection.side.client = connection.side().is_client()
                 );
 
+                let is_client = connection.side().is_client();
+                let stream_result = if is_client {
+                    Span::current().record("session.role", "dialer");
+                    select! {
+                        _ = candidate.cancelled() => {
+                            connection.close(VarInt::from_u32(0), b"session candidate canceled");
+                            return Ok(());
+                        }
+                        _ = connection.closed() => return Ok(()),
+                        result = connection.open_bi() => result,
+                    }
+                } else {
+                    Span::current().record("session.role", "listener");
+                    select! {
+                        _ = candidate.cancelled() => {
+                            connection.close(VarInt::from_u32(0), b"session candidate canceled");
+                            return Ok(());
+                        }
+                        _ = connection.closed() => return Ok(()),
+                        result = connection.accept_bi() => result,
+                    }
+                };
+                let mut transport = match stream_result {
+                    Ok(streams) => SessionTransport::new(streams),
+                    Err(error) => {
+                        error!(event = "session_candidate_stream_failure", error = ?error, peer.id = %peer);
+                        return Ok(());
+                    }
+                };
+                if is_client {
+                    select! {
+                        _ = candidate.cancelled() => {
+                            connection.close(VarInt::from_u32(0), b"session candidate canceled");
+                            return Ok(());
+                        }
+                        _ = connection.closed() => return Ok(()),
+                        result = write_message(&mut transport.send, &ProtocolMessage::KeepAlive) => {
+                            if let Err(error) = result {
+                                warn!(event = "session_candidate_bootstrap_write_failure", error = ?error, peer.id = %peer);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
+                loop {
+                    let slot_before_read = self.core_state.call_slot.snapshot()?;
+                    select! {
+                        _ = candidate.cancelled() => {
+                            connection.close(VarInt::from_u32(0), b"session candidate canceled");
+                            return Ok(());
+                        }
+                        _ = connection.closed() => return Ok(()),
+                        _ = old_state.finished() => break,
+                        result = read_message(&mut transport.recv) => {
+                            let message = match result {
+                                Ok(message) => message,
+                                Err(error) => {
+                                    warn!(event = "session_candidate_stream_read_failure", error = ?error, peer.id = %peer);
+                                    return Ok(());
+                                }
+                            };
+                            let can_reply_busy = if matches!(
+                                &message,
+                                ProtocolMessage::Hello {
+                                    ringtone,
+                                    audio_header,
+                                    room_hash: None,
+                                    ..
+                                } if audio_header.is_valid() && ringtone_is_within_limit(ringtone)
+                            ) {
+                                let slot_after_read = self.core_state.call_slot.snapshot()?;
+                                let predecessor_current = {
+                                    let states = self.session_states.read().await;
+                                    states.get(&peer).is_some_and(|current| current.id == old_state.id)
+                                };
+                                !candidate.is_cancelled()
+                                    && !old_state.is_finished()
+                                    && predecessor_current
+                                    && slot_before_read == slot_after_read
+                                    && slot_after_read.state == CallSlotState::ActiveDirect
+                                    && slot_after_read.direct_peer == Some(peer)
+                            } else {
+                                false
+                            };
+
+                            match &message {
+                                ProtocolMessage::KeepAlive => {
+                                    info!(event = "session_candidate_keepalive_received", peer.id = %peer);
+                                    continue;
+                                }
+                                ProtocolMessage::Busy => continue,
+                                _ if can_reply_busy => {
+                                    if let Err(error) = write_message(&mut transport.send, &ProtocolMessage::Busy).await {
+                                        warn!(event = "session_candidate_busy_write_failure", error = ?error, peer.id = %peer);
+                                        return Ok(());
+                                    }
+                                }
+                                _ => {
+                                    transport.buffered_message = Some(message);
+                                    info!(
+                                        event = "session_candidate_message_buffered",
+                                        peer.id = %peer,
+                                        session.id = %state.id,
+                                        old_session.id = %old_state.id
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 select! {
-                    biased;
                     _ = candidate.cancelled() => {
                         connection.close(VarInt::from_u32(0), b"session candidate canceled");
                         return Ok(());
@@ -886,6 +999,7 @@ where
                 self.publish_session_locked(peer);
                 candidate.promote();
                 drop(states);
+                retained_transport = Some(transport);
                 info!(
                     event = "session_collision_candidate_promoted",
                     peer.id = %peer,
@@ -923,7 +1037,14 @@ where
         });
 
         let _ = self
-            .session_outer(peer, &connection, &state, &contact, message_channel)
+            .session_outer(
+                peer,
+                &connection,
+                &state,
+                &contact,
+                message_channel,
+                retained_transport,
+            )
             .await;
         state.mark_finished();
 
@@ -1071,34 +1192,40 @@ where
         state: &Arc<SessionState>,
         contact: &Contact,
         mut message_channel: (Sender<ProtocolMessage>, Receiver<ProtocolMessage>),
+        retained_transport: Option<SessionTransport>,
     ) -> Result<()> {
-        let stream_result = if connection.side().is_client() {
-            Span::current().record("session.role", "dialer");
-            connection.open_bi().await
-        } else {
-            Span::current().record("session.role", "listener");
-            connection.accept_bi().await
-        };
+        let uses_retained_transport = retained_transport.is_some();
+        let transport = match retained_transport {
+            Some(transport) => transport,
+            None => {
+                let stream_result = if connection.side().is_client() {
+                    Span::current().record("session.role", "dialer");
+                    connection.open_bi().await
+                } else {
+                    Span::current().record("session.role", "listener");
+                    connection.accept_bi().await
+                };
 
-        let stream = match stream_result {
-            Ok(streams) => streams,
-            Err(error) => {
-                error!(event = "session_stream_failure", error = ?error, peer.id = %peer);
-                return Ok(());
+                match stream_result {
+                    Ok(streams) => SessionTransport::new(streams),
+                    Err(error) => {
+                        error!(event = "session_stream_failure", error = ?error, peer.id = %peer);
+                        return Ok(());
+                    }
+                }
             }
         };
 
         // controls keep alive messages
         let mut keep_alive = interval(KEEP_ALIVE);
-        // the length delimited transport used for the session
-        let mut send = LengthDelimitedCodec::builder()
-            .max_frame_length(SESSION_MAX_FRAME_LENGTH)
-            .length_field_type::<u64>()
-            .new_write(stream.0);
-        let mut recv = LengthDelimitedCodec::builder()
-            .max_frame_length(SESSION_MAX_FRAME_LENGTH)
-            .length_field_type::<u64>()
-            .new_read(stream.1);
+        if uses_retained_transport {
+            keep_alive.reset();
+        }
+        let SessionTransport {
+            mut send,
+            mut recv,
+            buffered_message,
+        } = transport;
 
         // the dialer for room sessions always starts a call
         if self.is_in_room(&peer).await && connection.side().is_client() {
@@ -1132,6 +1259,7 @@ where
             state,
             message_channel: &mut message_channel,
             keep_alive: &mut keep_alive,
+            buffered_message,
         };
 
         loop {
@@ -1722,7 +1850,7 @@ where
                     }
                 }
             }
-            result = read_message(io.recv) => {
+            result = read_session_message(&mut io.buffered_message, io.recv) => {
                 // Receiving any message during the accept prompt means the caller hung up (Goodbye)
                 // or sent something out-of-protocol; abort negotiation but keep the session alive.
                 release_pending(
@@ -1876,7 +2004,10 @@ where
                     .await?;
                     return Ok(OutgoingNegotiationOutcome::CallEnded);
                 }
-                result = timeout(hello_timeout, read_message(io.recv)) => {
+                result = timeout(
+                    hello_timeout,
+                    read_session_message(&mut io.buffered_message, io.recv),
+                ) => {
                     match result {
                         Err(_elapsed) => {
                             warn!(
@@ -1998,7 +2129,7 @@ where
                 info!(event = "session_stopped");
                 Ok(false)
             },
-            result = read_message(io.recv) => {
+            result = read_session_message(&mut io.buffered_message, io.recv) => {
                 info!(event = "session_message_received", ?result);
                 let mut other_ringtone = None;
                 let remote_audio_header;
@@ -3421,6 +3552,28 @@ pub(crate) struct OptionalCallArgs<'a> {
     state: &'a Arc<SessionState>,
 }
 
+struct SessionTransport {
+    send: FramedWrite<SendStream, LengthDelimitedCodec>,
+    recv: FramedRead<RecvStream, LengthDelimitedCodec>,
+    buffered_message: Option<ProtocolMessage>,
+}
+
+impl SessionTransport {
+    fn new((send, recv): (SendStream, RecvStream)) -> Self {
+        Self {
+            send: LengthDelimitedCodec::builder()
+                .max_frame_length(SESSION_MAX_FRAME_LENGTH)
+                .length_field_type::<u64>()
+                .new_write(send),
+            recv: LengthDelimitedCodec::builder()
+                .max_frame_length(SESSION_MAX_FRAME_LENGTH)
+                .length_field_type::<u64>()
+                .new_read(recv),
+            buffered_message: None,
+        }
+    }
+}
+
 /// Shared session transport and control handles passed through negotiation and handshake.
 pub(crate) struct SessionIo<'a> {
     pub(crate) send: &'a mut FramedWrite<SendStream, LengthDelimitedCodec>,
@@ -3429,6 +3582,18 @@ pub(crate) struct SessionIo<'a> {
     pub(crate) state: &'a Arc<SessionState>,
     pub(crate) message_channel: &'a mut (Sender<ProtocolMessage>, Receiver<ProtocolMessage>),
     pub(crate) keep_alive: &'a mut Interval,
+    buffered_message: Option<ProtocolMessage>,
+}
+
+async fn read_session_message(
+    buffered_message: &mut Option<ProtocolMessage>,
+    recv: &mut FramedRead<RecvStream, LengthDelimitedCodec>,
+) -> Result<ProtocolMessage> {
+    if let Some(message) = buffered_message.take() {
+        Ok(message)
+    } else {
+        read_message(recv).await
+    }
 }
 
 /// Per-call inputs for [`TelepathyCore::negotiate_incoming_call`].

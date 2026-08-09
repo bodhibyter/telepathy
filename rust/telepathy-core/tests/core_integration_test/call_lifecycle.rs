@@ -5,8 +5,8 @@ use super::common::{
     assert_no_call_ended_before_connected, build_client, build_client_with_accept_probe,
     build_client_with_call_ended_park, build_client_with_connected_gate, build_client_with_options,
     build_client_with_options_and_initial_contacts, call_state_snapshot, init_test_tracing,
-    shared_relay_map, wait_for_active_transport, wait_for_connected, wait_for_sessions,
-    wait_for_slot_idle, wait_for_slot_owned_by, wait_for_stable_session_pair,
+    shared_relay_map, wait_for_active_transport, wait_for_connected, wait_for_log_line,
+    wait_for_sessions, wait_for_slot_idle, wait_for_slot_owned_by, wait_for_stable_session_pair,
 };
 
 use iroh::{PublicKey, SecretKey};
@@ -2556,6 +2556,89 @@ async fn outbound_collision_transfers_accept_prompt_and_completes_call() {
     shutdown_guard.disarm();
     drop(shutdown_guard);
     client_a.telepathy.end_call().await;
+    client_a.telepathy.shutdown().await;
+    client_b.telepathy.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_client_candidate_bootstraps_remote_stream_accept() {
+    init_test_tracing();
+    let relay_map = shared_relay_map();
+    let codec_config = CodecConfig::new(true, true, 5.0);
+
+    let (key_a, key_b) = loop {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        if key_a.public() < key_b.public() {
+            break (key_a, key_b);
+        }
+    };
+    let contact_a = Contact::new(
+        "deferred-client-candidate-a".to_string(),
+        key_a.public().to_string(),
+    )
+    .expect("contact a invalid");
+    let contact_b = Contact::new(
+        "deferred-client-candidate-b".to_string(),
+        key_b.public().to_string(),
+    )
+    .expect("contact b invalid");
+    let peer_a = contact_a.get_peer_id();
+    let peer_b = contact_b.get_peer_id();
+
+    let client_a = build_client(
+        relay_map,
+        key_a,
+        vec![contact_b.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let client_b = build_client(
+        relay_map,
+        key_b,
+        vec![contact_a.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let shutdown_guard = TwoClientShutdownGuard {
+        a: &client_a,
+        b: &client_b,
+        dropped: AtomicBool::new(false),
+    };
+
+    client_b.session_status_probe.park_connecting();
+    client_b.telepathy.start_session(&contact_a).await;
+    client_b
+        .session_status_probe
+        .wait_for(peer_a.as_bytes(), SessionStatus::Connecting)
+        .await;
+
+    client_a.telepathy.start_session(&contact_b).await;
+    wait_for_sessions(&client_a, &contact_b, &client_b, &contact_a).await;
+
+    client_b.session_status_probe.release_connecting();
+    wait_for_log_line(
+        &["session_candidate_keepalive_received", &peer_b.to_string()],
+        "deferred client candidate must make its stream visible to the remote acceptor",
+    )
+    .await;
+
+    shutdown_guard.disarm();
+    drop(shutdown_guard);
     client_a.telepathy.shutdown().await;
     client_b.telepathy.shutdown().await;
 }

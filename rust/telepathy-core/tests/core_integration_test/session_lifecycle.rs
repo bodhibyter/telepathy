@@ -3,7 +3,8 @@ use super::common::{
     assert_no_busy_end, assert_no_call_ended_before_connected, build_client,
     build_client_with_accept_probe, build_client_with_lookup_contacts, build_client_with_options,
     call_state_snapshot, init_test_tracing, shared_address_lookup, shared_relay_map,
-    wait_for_active_transport, wait_for_connected, wait_for_sessions, wait_for_stable_session_pair,
+    wait_for_active_transport, wait_for_connected, wait_for_log_line, wait_for_sessions,
+    wait_for_stable_session_pair,
 };
 
 use iroh::SecretKey;
@@ -12,7 +13,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use telepathy_audio::devices::{MockAudioHost, MockAudioInput, MockAudioOutput};
-use telepathy_core::internal::state::SessionState;
+use telepathy_core::internal::state::{CallSlotState, SessionState};
 use telepathy_core::types::Contact;
 use telepathy_core::types::{CallState, CodecConfig, SessionStatus};
 use tokio::time::sleep;
@@ -262,6 +263,196 @@ async fn stale_predecessor_promotes_same_identity_replacement_and_allows_call() 
         .expect("the promoted session should carry a new call");
     wait_for_connected(&call_states_replacement_b, "replacement client_b").await;
     wait_for_connected(&call_states_a, "client_a after handoff").await;
+
+    replacement_client_b.telepathy.end_call().await;
+    replacement_client_b.telepathy.shutdown().await;
+    client_a.telepathy.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_candidate_hello_is_negotiated_after_predecessor_finishes() {
+    init_test_tracing();
+    let relay_map = shared_relay_map();
+    let codec_config = CodecConfig::new(true, true, 5.0);
+
+    let (key_a, key_b) = loop {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        if key_a.public() < key_b.public() {
+            break (key_a, key_b);
+        }
+    };
+    let replacement_key_b = key_b.clone();
+    let contact_a = Contact::new(
+        "buffered-hello-client-a".to_string(),
+        key_a.public().to_string(),
+    )
+    .expect("contact a invalid");
+    let contact_b = Contact::new(
+        "buffered-hello-client-b".to_string(),
+        key_b.public().to_string(),
+    )
+    .expect("contact b invalid");
+    let peer_b = contact_b.get_peer_id();
+    let call_states_a = Arc::new(Mutex::new(Vec::new()));
+    let call_states_replacement_b = Arc::new(Mutex::new(Vec::new()));
+    let accept_probe_a = PendingAcceptProbe::default();
+
+    let client_a = build_client_with_accept_probe(
+        relay_map,
+        key_a,
+        vec![contact_b.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        call_states_a.clone(),
+        accept_probe_a.clone(),
+    )
+    .await;
+    let old_client_b = build_client(
+        relay_map,
+        key_b,
+        vec![contact_a.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+
+    client_a.telepathy.start_session(&contact_b).await;
+    old_client_b.telepathy.start_session(&contact_a).await;
+    wait_for_sessions(&client_a, &contact_b, &old_client_b, &contact_a).await;
+    wait_for_active_transport(&client_a, "client_a predecessor").await;
+    wait_for_active_transport(&old_client_b, "old client_b predecessor").await;
+    let predecessor_id = client_a
+        .telepathy
+        .inner
+        .session_states
+        .read()
+        .await
+        .get(&peer_b)
+        .map(|state| state.id())
+        .expect("client_a should register the predecessor");
+    let peer_b_id = peer_b.to_string();
+    let predecessor_log_id = predecessor_id.to_string();
+
+    let replacement_client_b = build_client(
+        relay_map,
+        replacement_key_b,
+        vec![contact_a.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        call_states_replacement_b.clone(),
+    )
+    .await;
+    replacement_client_b
+        .telepathy
+        .start_session(&contact_a)
+        .await;
+    replacement_client_b
+        .session_status_probe
+        .wait_for(
+            contact_a.get_peer_id().as_bytes(),
+            SessionStatus::Connected {
+                relayed: false,
+                remote_address: String::new(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        client_a
+            .telepathy
+            .inner
+            .session_states
+            .read()
+            .await
+            .get(&peer_b)
+            .map(|state| state.id()),
+        Some(predecessor_id),
+        "the replacement must remain deferred behind its live predecessor"
+    );
+
+    replacement_client_b
+        .telepathy
+        .start_call(&contact_a)
+        .await
+        .expect("replacement should send its deferred Hello");
+    assert_eq!(
+        accept_probe_a.opened.load(Relaxed),
+        0,
+        "the deferred candidate must not negotiate its Hello before predecessor completion"
+    );
+    wait_for_log_line(
+        &[
+            "session_candidate_message_buffered",
+            &peer_b_id,
+            &predecessor_log_id,
+        ],
+        "replacement Hello must buffer behind the generated predecessor session",
+    )
+    .await;
+
+    old_client_b.telepathy.shutdown().await;
+
+    let promoted_id = {
+        let promoted = async {
+            loop {
+                let current = client_a
+                    .telepathy
+                    .inner
+                    .session_states
+                    .read()
+                    .await
+                    .get(&peer_b)
+                    .map(|state| state.id());
+                if current != Some(predecessor_id) {
+                    return current.expect("client_a should promote the deferred candidate");
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), promoted)
+            .await
+            .unwrap_or_else(|_| panic!("the completed predecessor must promote its candidate"))
+    };
+    assert_ne!(
+        promoted_id, predecessor_id,
+        "only the completed predecessor may yield ownership to the candidate"
+    );
+
+    accept_probe_a.wait_opened().await;
+    assert_eq!(
+        accept_probe_a.opened.load(Relaxed),
+        1,
+        "the retained Hello should open exactly one prompt after promotion"
+    );
+    accept_probe_a.accept();
+    accept_probe_a.wait_accepted().await;
+    wait_for_connected(&call_states_a, "client_a buffered candidate Hello").await;
+    wait_for_connected(
+        &call_states_replacement_b,
+        "replacement client_b buffered candidate Hello",
+    )
+    .await;
+
+    let replacement_states = call_state_snapshot(&call_states_replacement_b);
+    assert_no_busy_end(&replacement_states, "replacement client_b");
+    assert_no_call_ended_before_connected(&replacement_states, "replacement client_b");
 
     replacement_client_b.telepathy.end_call().await;
     replacement_client_b.telepathy.shutdown().await;
@@ -983,18 +1174,16 @@ async fn session_collision_kept_new_preserves_pending_accept_prompt() {
 /// there holding an active call with the same identity. The correct behavior
 /// is a prompt terminal answer (Busy) from the parked candidate.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "recreation for the deferred-candidate starvation follow-up; fails until the parked candidate answers"]
 async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
     init_test_tracing();
     let relay_map = shared_relay_map();
     let codec_config = CodecConfig::new(true, true, 5.0);
 
-    // Alice sorts before Bob so Alice-dialed connections become deferred
-    // candidates on Bob (`should_keep_new_session` keeps Bob's existing session).
+    // Bob sorts before Alice so Alice's replacement dial becomes deferred on Bob.
     let (key_a, key_b) = loop {
         let key_a = SecretKey::generate();
         let key_b = SecretKey::generate();
-        if key_a.public() < key_b.public() {
+        if key_b.public() < key_a.public() {
             break (key_a, key_b);
         }
     };
@@ -1009,6 +1198,7 @@ async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
         key_b.public().to_string(),
     )
     .expect("contact b invalid");
+    let peer_a = contact_a.get_peer_id();
     let peer_b = contact_b.get_peer_id();
 
     let call_states_a = Arc::new(Mutex::new(Vec::new()));
@@ -1047,8 +1237,16 @@ async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
     .await;
 
     client_a.telepathy.start_session(&contact_b).await;
-    client_b.telepathy.start_session(&contact_a).await;
     wait_for_sessions(&client_a, &contact_b, &client_b, &contact_a).await;
+    let predecessor_id = client_b
+        .telepathy
+        .inner
+        .session_states
+        .read()
+        .await
+        .get(&peer_a)
+        .map(|state| state.id())
+        .expect("bob should register Alice's listener predecessor session");
 
     // Establish the active call on the session Bob will keep.
     client_a
@@ -1060,6 +1258,15 @@ async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
     accept_probe_b.accept();
     wait_for_connected(&call_states_a, "alice original call").await;
     wait_for_connected(&call_states_b, "bob original call").await;
+    let active_predecessor_slot = client_b
+        .telepathy
+        .inner
+        .core_state
+        .call_slot
+        .snapshot()
+        .expect("bob active predecessor slot snapshot should succeed");
+    assert_eq!(active_predecessor_slot.state, CallSlotState::ActiveDirect);
+    assert_eq!(active_predecessor_slot.direct_peer, Some(peer_a));
 
     // The same identity reconnects (new process instance); on Bob it defers
     // behind the session that owns the active call.
@@ -1091,6 +1298,30 @@ async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
             },
         )
         .await;
+    let replacement_predecessor_id = client_b
+        .telepathy
+        .inner
+        .session_states
+        .read()
+        .await
+        .get(&peer_a)
+        .map(|state| state.id());
+    let replacement_slot = client_b
+        .telepathy
+        .inner
+        .core_state
+        .call_slot
+        .snapshot()
+        .expect("bob replacement slot snapshot should succeed");
+    assert_eq!(
+        replacement_predecessor_id,
+        Some(predecessor_id),
+        "bob must retain the predecessor while Alice's replacement is deferred"
+    );
+    assert_eq!(
+        replacement_slot, active_predecessor_slot,
+        "deferred candidate setup must preserve Bob's active predecessor slot before its call"
+    );
 
     // A call on the deferred candidate connection must be answered, not
     // starved: the caller should terminalize promptly (Busy), not after the
@@ -1140,4 +1371,117 @@ async fn call_on_deferred_same_identity_candidate_starves_without_reader() {
     replacement_client_a.telepathy.shutdown().await;
     client_b.telepathy.shutdown().await;
     client_a.telepathy.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_deferred_listener_candidate_before_stream_bootstrap() {
+    init_test_tracing();
+    let relay_map = shared_relay_map();
+    let codec_config = CodecConfig::new(true, true, 5.0);
+
+    let (key_a, key_b) = loop {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        if key_a.public() < key_b.public() {
+            break (key_a, key_b);
+        }
+    };
+    let contact_a = Contact::new(
+        "deferred-listener-shutdown-a".to_string(),
+        key_a.public().to_string(),
+    )
+    .expect("contact a invalid");
+    let contact_b = Contact::new(
+        "deferred-listener-shutdown-b".to_string(),
+        key_b.public().to_string(),
+    )
+    .expect("contact b invalid");
+    let peer_a = contact_a.get_peer_id();
+    let peer_b = contact_b.get_peer_id();
+
+    let client_a = build_client(
+        relay_map,
+        key_a,
+        vec![contact_b.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let client_b = build_client(
+        relay_map,
+        key_b,
+        vec![contact_a.clone()],
+        &codec_config,
+        MockAudioHost::new(
+            MockAudioInput::default(),
+            DEFAULT_SAMPLE_RATE,
+            MockAudioOutput,
+            DEFAULT_SAMPLE_RATE,
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let shutdown_guard = TwoClientShutdownGuard {
+        a: &client_a,
+        b: &client_b,
+        dropped: AtomicBool::new(false),
+    };
+
+    client_b.session_status_probe.park_connecting();
+    client_b.telepathy.start_session(&contact_a).await;
+    client_b
+        .session_status_probe
+        .wait_for(peer_a.as_bytes(), SessionStatus::Connecting)
+        .await;
+
+    client_a.telepathy.start_session(&contact_b).await;
+    wait_for_sessions(&client_a, &contact_b, &client_b, &contact_a).await;
+
+    let remote_session_lock = client_b.telepathy.inner.session_states.write().await;
+    client_b.session_status_probe.release_connecting();
+    wait_for_log_line(
+        &[
+            "session_collision_deferred_candidate",
+            &peer_b.to_string(),
+            "connection.side.client=false",
+        ],
+        "target must register its deferred listener candidate before remote stream bootstrap",
+    )
+    .await;
+
+    let target_shutdown =
+        tokio::time::timeout(Duration::from_secs(5), client_a.telepathy.shutdown()).await;
+
+    drop(remote_session_lock);
+    let (cleanup_a, cleanup_b) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(15), client_a.telepathy.shutdown()),
+        tokio::time::timeout(Duration::from_secs(15), client_b.telepathy.shutdown()),
+    );
+    shutdown_guard.disarm();
+    drop(shutdown_guard);
+
+    assert!(
+        target_shutdown.is_ok(),
+        "target shutdown must cancel its deferred listener candidate before stream bootstrap"
+    );
+    assert!(cleanup_a.is_ok(), "target cleanup shutdown must complete");
+    assert!(cleanup_b.is_ok(), "remote cleanup shutdown must complete");
+    assert_eq!(
+        client_a
+            .telepathy
+            .inner
+            .core_state
+            .call_slot
+            .snapshot()
+            .expect("target call slot snapshot should succeed")
+            .state,
+        CallSlotState::Idle,
+        "shutdown must not create an active direct-call state"
+    );
 }
