@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM nginx:1.27-alpine
 
-COPY nginx-default.conf /etc/nginx/conf.d/default.conf
-COPY web/ /usr/share/nginx/html/
+COPY deploy/nginx-default.conf /etc/nginx/conf.d/default.conf
+COPY deploy/web/ /usr/share/nginx/html/
 
 # Verify the wasm-pack bundle the Dart code expects is present.
 RUN set -eux; \
